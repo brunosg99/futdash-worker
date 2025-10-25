@@ -1,0 +1,23 @@
+# Imagem base com suporte a GPU
+FROM pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libglib2.0-0 libgl1 tesseract-ocr ffmpeg && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY worker/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY core/ ./core/
+COPY data/ ./data/
+COPY weights/ ./weights/
+COPY worker/worker.py ./worker.py
+
+ENV REDIS_URL="redis://redis:6379/0"
+ENV QUEUE_PLUS="qv2:high"
+ENV QUEUE_FREE="qv2:default"
+ENV STORE_DIR="/data"
+ENV IDLE_EXIT_MIN="15"
+
+CMD ["python", "worker.py"]
