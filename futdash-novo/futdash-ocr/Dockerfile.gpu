@@ -1,0 +1,30 @@
+# Dockerfile.gpu — worker com CUDA
+FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+
+# Dependências do sistema (OpenCV + Tesseract)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-pip python3-venv \
+    libglib2.0-0 libgl1 tesseract-ocr \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Python
+RUN python3 -m pip install --upgrade pip
+
+# PyTorch GPU (CUDA 12.1)
+RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu121 \
+    torch==2.6.0 torchvision==0.21.0
+
+# Requisitos do worker (sem torch/vision aqui)
+COPY worker/requirements.txt /app/worker/requirements.txt
+RUN pip install --no-cache-dir -r /app/worker/requirements.txt
+
+# Código
+COPY . .
+
+# Diretórios de dados
+RUN mkdir -p /data/uploads /data/results
+
+# Iniciar direto o worker
+CMD ["python3", "-m", "worker.worker"]
