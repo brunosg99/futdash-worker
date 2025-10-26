@@ -108,15 +108,26 @@ def process_job(payload: str, processor: HudProcessor):
 
         results = processor.process_frame(frame)
 
+        # Salva no disco (opcional, bom para auditoria/debug)
         out_path = RESULTS_DIR / f"{job_id}.json"
         out_path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        r.hset(f"job:{job_id}", mapping={"status": "done"})
+        # >>> NOVO: grava o resultado também no Redis para o /jobs/{job_id}
+        r.hset(
+            f"job:{job_id}",
+            mapping={
+                "status": "done",
+                "result": json.dumps(results, ensure_ascii=False)  # string JSON
+            }
+        )
+
         log.info(f"[worker] ✅ Job {job_id} concluído.")
+
     except Exception as e:
         log.error(f"[worker] Erro no job {job_id}: {e}")
         traceback.print_exc()
         r.hset(f"job:{job_id}", mapping={"status": "failed", "error": str(e)})
+
 
 # ----------------------
 # Loop principal
@@ -143,3 +154,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
