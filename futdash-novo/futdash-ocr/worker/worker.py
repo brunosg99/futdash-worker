@@ -26,32 +26,42 @@ def _allow_ultralytics_unpickling():
     """
     Registra classes do Ultralytics/PyTorch necessárias para deserializar checkpoints
     quando torch.load usa weights_only=True (comportamento padrão no PyTorch 2.6+).
+    Cobri um conjunto amplo para YOLOv8.
     """
     import torch
     import torch.nn as nn
+    from torch.serialization import add_safe_globals
+
+    # Ultralytics
     import ultralytics
     from ultralytics.nn import modules as um, tasks as ut
 
-    torch.serialization.add_safe_globals([
+    add_safe_globals([
         # núcleo YOLO (Ultralytics)
         ut.DetectionModel,
 
-        # containers PyTorch
+        # containers PyTorch (caminhos curtos e completos)
         nn.Sequential,
         nn.modules.container.Sequential,
         nn.ModuleList,
         nn.modules.container.ModuleList,
+        nn.ModuleDict,
+        nn.modules.container.ModuleDict,
 
-        # blocos/camadas YOLOv8
+        # blocos/camadas YOLOv8 mais comuns
         um.conv.Conv,
+        um.conv.Concat,          # <---- IMPORTANTE (erro atual)
         um.block.C2f,
         um.block.Bottleneck,
         um.block.SPPF,
+        um.block.C3 if hasattr(um.block, "C3") else nn.Identity,
+        um.block.C3x if hasattr(um.block, "C3x") else nn.Identity,
         um.head.Detect,
 
         # camadas PyTorch comuns
-        nn.Conv2d, nn.BatchNorm2d, nn.SiLU, nn.ReLU, nn.LeakyReLU,
-        nn.Upsample, nn.MaxPool2d, nn.AdaptiveAvgPool2d, nn.Dropout,
+        nn.Conv2d, nn.BatchNorm2d, nn.SyncBatchNorm,
+        nn.SiLU, nn.ReLU, nn.LeakyReLU,
+        nn.Upsample, nn.MaxPool2d, nn.AdaptiveAvgPool2d, nn.Dropout, nn.Identity,
     ])
 
 
