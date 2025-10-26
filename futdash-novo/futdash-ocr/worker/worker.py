@@ -9,7 +9,7 @@ import tempfile
 from pathlib import Path
 
 import cv2
-import numpy as np  # se o core usar numpy; mantém import
+import numpy as np
 import redis
 import requests
 
@@ -33,16 +33,22 @@ def _allow_ultralytics_unpickling():
     from ultralytics.nn import modules as um, tasks as ut
 
     torch.serialization.add_safe_globals([
-        # núcleo YOLO
+        # núcleo YOLO (Ultralytics)
         ut.DetectionModel,
-        # containers comuns
-        nn.Sequential, nn.modules.container.Sequential,
+
+        # containers PyTorch
+        nn.Sequential,
+        nn.modules.container.Sequential,
+        nn.ModuleList,
+        nn.modules.container.ModuleList,
+
         # blocos/camadas YOLOv8
         um.conv.Conv,
         um.block.C2f,
         um.block.Bottleneck,
         um.block.SPPF,
         um.head.Detect,
+
         # camadas PyTorch comuns
         nn.Conv2d, nn.BatchNorm2d, nn.SiLU, nn.ReLU, nn.LeakyReLU,
         nn.Upsample, nn.MaxPool2d, nn.AdaptiveAvgPool2d, nn.Dropout,
