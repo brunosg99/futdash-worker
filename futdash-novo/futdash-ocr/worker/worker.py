@@ -1,75 +1,75 @@
 # worker/worker.py
-import os
-import json
-import time
-import ssl
-import logging
-import traceback
-import tempfile
+import os, json, time, ssl, logging, traceback, tempfile
 from pathlib import Path
 
-import cv2
-import numpy as np
-import redis
-import requests
-
+import cv2, numpy as np, redis, requests
 from core.core_logic import HudProcessor  # sua lógica principal
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s: %(message)s")
 log = logging.getLogger("worker")
 
-
 # -------------------------------------------------------------------
-# 1) Allowlist para deserialização segura (PyTorch 2.6+ / weights_only)
+# 1) Allowlist ampla para deserialização (PyTorch 2.6+ / weights_only)
 # -------------------------------------------------------------------
 def _allow_ultralytics_unpickling():
-    """
-    Registra classes do Ultralytics/PyTorch necessárias para deserializar checkpoints
-    quando torch.load usa weights_only=True (comportamento padrão no PyTorch 2.6+).
-    Cobri um conjunto amplo para YOLOv8.
-    """
     import torch
     import torch.nn as nn
     from torch.serialization import add_safe_globals
-
     # Ultralytics
     import ultralytics
     from ultralytics.nn import modules as um, tasks as ut
 
+    def _maybe(mod, name, fallback=None):
+        return getattr(mod, name, fallback if fallback is not None else nn.Identity)
+
     add_safe_globals([
-        # núcleo YOLO (Ultralytics)
+        # Núcleo YOLO
         ut.DetectionModel,
 
-        # containers PyTorch (caminhos curtos e completos)
-        nn.Sequential,
-        nn.modules.container.Sequential,
-        nn.ModuleList,
-        nn.modules.container.ModuleList,
-        nn.ModuleDict,
-        nn.modules.container.ModuleDict,
+        # Containers PyTorch (curtos e caminhos completos)
+        nn.Sequential, nn.modules.container.Sequential,
+        nn.ModuleList, nn.modules.container.ModuleList,
+        nn.ModuleDict, nn.modules.container.ModuleDict,
 
-        # blocos/camadas YOLOv8 mais comuns
-        um.conv.Conv,
-        um.conv.Concat,          # <---- IMPORTANTE (erro atual)
-        um.block.C2f,
-        um.block.Bottleneck,
-        um.block.SPPF,
-        um.block.C3 if hasattr(um.block, "C3") else nn.Identity,
-        um.block.C3x if hasattr(um.block, "C3x") else nn.Identity,
-        um.head.Detect,
-
-        # camadas PyTorch comuns
+        # Camadas PyTorch comuns
         nn.Conv2d, nn.BatchNorm2d, nn.SyncBatchNorm,
-        nn.SiLU, nn.ReLU, nn.LeakyReLU,
-        nn.Upsample, nn.MaxPool2d, nn.AdaptiveAvgPool2d, nn.Dropout, nn.Identity,
-    ])
+        nn.SiLU, nn.ReLU, nn.LeakyReLU, nn.GELU,
+        nn.Upsample, nn.MaxPool2d, nn.AdaptiveAvgPool2d,
+        nn.Dropout, nn.Identity,
 
+        # ---- Ultralytics YOLOv8/YOLOv9 comuns ----
+        # conv
+        um.conv.Conv, _maybe(um.conv, "DWConv"), _maybe(um.conv, "RepConv"),
+        um.conv.Concat,  # <- apareceu no erro anterior
+
+        # block
+        um.block.C2f, um.block.Bottleneck, um.block.SPPF,
+        _maybe(um.block, "C3"), _maybe(um.block, "C3x"),
+        _maybe(um.block, "BottleneckCSP"),
+        _maybe(um.block, "Res", nn.Identity),
+        _maybe(um.block, "GhostBottleneck", nn.Identity),
+        _maybe(um.block, "ConvBnAct", nn.Identity),
+        _maybe(um.block, "Expand", nn.Identity),
+        _maybe(um.block, "Contract", nn.Identity),
+
+        # DFL (Distribution Focal Loss layer) – <- erro ATUAL
+        _maybe(um.block, "DFL"),
+
+        # head
+        um.head.Detect,
+        _maybe(um.head, "Classify"), _maybe(um.head, "Segment"),
+        _maybe(um.head, "Pose"), _maybe(um.head, "RTDETRDecoder"),
+
+        # rtm / transformer (presentes em alguns pesos)
+        _maybe(um, "rtm", um),  # módulo como fallback
+        _maybe(um, "transformer", um),  # idem
+    ])
 
 # ---------------------------------------------------------
 # 2) Redis: aceita REDIS_URL OU HOST/PORT/USER/PASS (Upstash)
 # ---------------------------------------------------------
 def connect_redis():
-    url = (os.getenv("REDIS_URL") or "").strip()
+    url  = (os.getenv("REDIS_URL") or "").strip()
     host = os.getenv("REDIS_HOST")
     port = int(os.getenv("REDIS_PORT", "6379"))
     user = os.getenv("REDIS_USER")
@@ -79,9 +79,7 @@ def connect_redis():
         if url and (url.startswith("redis://") or url.startswith("rediss://")):
             extra = {"decode_responses": True}
             if url.startswith("rediss://"):
-                # Upstash com TLS
-                extra["ssl_cert_reqs"] = ssl.CERT_NONE
-            # Loga só o host para não expor credenciais
+                extra["ssl_cert_reqs"] = ssl.CERT_NONE  # Upstash TLS
             log.info(f"[worker] Redis via URL: {url.split('@')[-1]}")
             return redis.Redis.from_url(url, **extra)
 
@@ -98,7 +96,6 @@ def connect_redis():
         log.error(f"[worker] Falha ao conectar Redis: {e}")
         raise
 
-
 # -----------------------------
 # 3) Configurações de execução
 # -----------------------------
@@ -113,24 +110,17 @@ RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 IDLE_EXIT_MIN = int(os.getenv("IDLE_EXIT_MIN", "15"))
 IDLE_EXIT_SEC = IDLE_EXIT_MIN * 60
 
-
 # ------------------------------------------------
-# 4) Utilitários de I/O: download e leitura imagem
+# 4) Utilitários de I/O
 # ------------------------------------------------
 def download_to_temp(url: str) -> str:
-    """Baixa a imagem via HTTP e retorna caminho de arquivo temporário local."""
     with tempfile.NamedTemporaryFile(delete=False, suffix=".img") as tmp:
         resp = requests.get(url, timeout=60)
         resp.raise_for_status()
         tmp.write(resp.content)
         return tmp.name
 
-
 def read_image_from_job(job: dict):
-    """
-    Lê a imagem do job. Se houver 'download_url' (URL pública da API), baixa.
-    Senão tenta 'image_path' (caminho local no pod — normalmente não será válido).
-    """
     download_url = job.get("download_url")
     image_path   = job.get("image_path")
 
@@ -139,21 +129,17 @@ def read_image_from_job(job: dict):
         try:
             img = cv2.imread(tmp_path)
         finally:
-            try:
-                os.unlink(tmp_path)
-            except Exception:
-                pass
+            try: os.unlink(tmp_path)
+            except Exception: pass
         return img
 
-    # fallback: tentar caminho local
     if image_path:
         return cv2.imread(image_path)
 
     return None
 
-
 # ----------------------------------------
-# 5) Processamento do job (YOLO + seu core)
+# 5) Processamento do job
 # ----------------------------------------
 def process_job(payload: str, processor: HudProcessor):
     job = json.loads(payload)
@@ -174,34 +160,27 @@ def process_job(payload: str, processor: HudProcessor):
 
         r.hset(f"job:{job_id}", mapping={"status": "done"})
         log.info(f"[worker] ✅ Job {job_id} concluído.")
-
     except Exception as e:
         log.error(f"[worker] Erro no job {job_id}: {e}")
         traceback.print_exc()
         r.hset(f"job:{job_id}", mapping={"status": "failed", "error": str(e)})
 
-
 # ----------------------
 # 6) Loop principal
 # ----------------------
 def main():
-    # habilita allowlist do pickle/torch antes de carregar o YOLO
+    # Habilita allowlist ANTES de carregar o YOLO
     _allow_ultralytics_unpickling()
 
     log.info("HudProcessor: inicializando...")
     processor = HudProcessor(ckpt_path="weights/best.pt")
-    # o HudProcessor decide cpu/gpu; pode logar internamente também
     log.info("[worker] device ativo: cpu/gpu conforme core")
 
     log.info(f"[worker] Iniciando... filas: {QUEUE_PLUS}, {QUEUE_FREE}")
     last_job_ts = time.time()
 
     while True:
-        # tenta primeiro a fila “rápida” e depois a padrão
-        payload = r.lpop(QUEUE_PLUS)
-        if payload is None:
-            payload = r.lpop(QUEUE_FREE)
-
+        payload = r.lpop(QUEUE_PLUS) or r.lpop(QUEUE_FREE)
         if payload:
             last_job_ts = time.time()
             process_job(payload, processor)
@@ -210,7 +189,6 @@ def main():
             if time.time() - last_job_ts > IDLE_EXIT_SEC:
                 log.info(f"[worker] idle por {IDLE_EXIT_MIN} min. Encerrando.")
                 break
-
 
 if __name__ == "__main__":
     main()
