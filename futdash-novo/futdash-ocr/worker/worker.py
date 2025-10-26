@@ -11,59 +11,69 @@ log = logging.getLogger("worker")
 # -------------------------------------------------------------------
 # 1) Allowlist ampla para deserialização (PyTorch 2.6+ / weights_only)
 # -------------------------------------------------------------------
+# --- SUBSTITUA APENAS ESTA FUNÇÃO NO worker/worker.py ---
+
 def _allow_ultralytics_unpickling():
+    """
+    Allowlist robusta para PyTorch 2.6+:
+    - Só adiciona CLASSES/FUNÇÕES reais (nada de módulos).
+    - Cobre os blocos/camadas comuns do YOLOv8.
+    """
+    import inspect
     import torch
     import torch.nn as nn
     from torch.serialization import add_safe_globals
+
     # Ultralytics
-    import ultralytics
     from ultralytics.nn import modules as um, tasks as ut
 
-    def _maybe(mod, name, fallback=None):
-        return getattr(mod, name, fallback if fallback is not None else nn.Identity)
+    def maybe_get(obj, name):
+        """pega atributo se existir e for classe/função; caso contrário retorna None."""
+        x = getattr(obj, name, None)
+        if inspect.isclass(x) or inspect.isfunction(x):
+            return x
+        return None
 
-    add_safe_globals([
-        # Núcleo YOLO
-        ut.DetectionModel,
+    allow = []
 
-        # Containers PyTorch (curtos e caminhos completos)
+    # Núcleo YOLO
+    allow += [ut.DetectionModel]
+
+    # Containers PyTorch
+    allow += [
         nn.Sequential, nn.modules.container.Sequential,
         nn.ModuleList, nn.modules.container.ModuleList,
         nn.ModuleDict, nn.modules.container.ModuleDict,
+    ]
 
-        # Camadas PyTorch comuns
+    # Camadas PyTorch comuns
+    allow += [
         nn.Conv2d, nn.BatchNorm2d, nn.SyncBatchNorm,
         nn.SiLU, nn.ReLU, nn.LeakyReLU, nn.GELU,
         nn.Upsample, nn.MaxPool2d, nn.AdaptiveAvgPool2d,
         nn.Dropout, nn.Identity,
+    ]
 
-        # ---- Ultralytics YOLOv8/YOLOv9 comuns ----
-        # conv
-        um.conv.Conv, _maybe(um.conv, "DWConv"), _maybe(um.conv, "RepConv"),
-        um.conv.Concat,  # <- apareceu no erro anterior
+    # ---- Ultralytics YOLOv8 (somente se forem classes/funções) ----
+    # conv
+    for name in ["Conv", "DWConv", "RepConv", "Concat"]:
+        x = maybe_get(um.conv, name)
+        if x: allow.append(x)
 
-        # block
-        um.block.C2f, um.block.Bottleneck, um.block.SPPF,
-        _maybe(um.block, "C3"), _maybe(um.block, "C3x"),
-        _maybe(um.block, "BottleneckCSP"),
-        _maybe(um.block, "Res", nn.Identity),
-        _maybe(um.block, "GhostBottleneck", nn.Identity),
-        _maybe(um.block, "ConvBnAct", nn.Identity),
-        _maybe(um.block, "Expand", nn.Identity),
-        _maybe(um.block, "Contract", nn.Identity),
+    # block
+    for name in ["C2f", "Bottleneck", "SPPF", "C3", "C3x", "BottleneckCSP", "DFL"]:
+        x = maybe_get(um.block, name)
+        if x: allow.append(x)
 
-        # DFL (Distribution Focal Loss layer) – <- erro ATUAL
-        _maybe(um.block, "DFL"),
+    # head
+    for name in ["Detect", "Classify", "Segment", "Pose", "RTDETRDecoder"]:
+        x = maybe_get(um.head, name)
+        if x: allow.append(x)
 
-        # head
-        um.head.Detect,
-        _maybe(um.head, "Classify"), _maybe(um.head, "Segment"),
-        _maybe(um.head, "Pose"), _maybe(um.head, "RTDETRDecoder"),
+    # IMPORTANTE: não adicionar módulos inteiros aqui (ex.: um.rtm, um.transformer) — só classes/funções!
 
-        # rtm / transformer (presentes em alguns pesos)
-        _maybe(um, "rtm", um),  # módulo como fallback
-        _maybe(um, "transformer", um),  # idem
-    ])
+    add_safe_globals(allow)
+
 
 # ---------------------------------------------------------
 # 2) Redis: aceita REDIS_URL OU HOST/PORT/USER/PASS (Upstash)
@@ -192,3 +202,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
