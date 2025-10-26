@@ -3,80 +3,23 @@ import os, json, time, ssl, logging, traceback, tempfile
 from pathlib import Path
 
 import cv2, numpy as np, redis, requests
+
+# >>> Monkey patch: força torch.load(weights_only=False) globalmente <<<
+import torch
+_ORIG_TORCH_LOAD = torch.load
+def _torch_load_no_weights_only(*args, **kwargs):
+    # Desativa o modo seguro por pesos. Útil quando o checkpoint é confiável (seu .pt).
+    kwargs["weights_only"] = False
+    return _ORIG_TORCH_LOAD(*args, **kwargs)
+torch.load = _torch_load_no_weights_only  # APLICA O PATCH ANTES DE IMPORTAR/CRIAR O MODELO
+
 from core.core_logic import HudProcessor  # sua lógica principal
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s: %(message)s")
 log = logging.getLogger("worker")
 
-# -------------------------------------------------------------------
-# 1) Allowlist ampla para deserialização (PyTorch 2.6+ / weights_only)
-# -------------------------------------------------------------------
-# --- SUBSTITUA APENAS ESTA FUNÇÃO NO worker/worker.py ---
-
-def _allow_ultralytics_unpickling():
-    """
-    Allowlist robusta para PyTorch 2.6+:
-    - Só adiciona CLASSES/FUNÇÕES reais (nada de módulos).
-    - Cobre os blocos/camadas comuns do YOLOv8.
-    """
-    import inspect
-    import torch
-    import torch.nn as nn
-    from torch.serialization import add_safe_globals
-
-    # Ultralytics
-    from ultralytics.nn import modules as um, tasks as ut
-
-    def maybe_get(obj, name):
-        """pega atributo se existir e for classe/função; caso contrário retorna None."""
-        x = getattr(obj, name, None)
-        if inspect.isclass(x) or inspect.isfunction(x):
-            return x
-        return None
-
-    allow = []
-
-    # Núcleo YOLO
-    allow += [ut.DetectionModel]
-
-    # Containers PyTorch
-    allow += [
-        nn.Sequential, nn.modules.container.Sequential,
-        nn.ModuleList, nn.modules.container.ModuleList,
-        nn.ModuleDict, nn.modules.container.ModuleDict,
-    ]
-
-    # Camadas PyTorch comuns
-    allow += [
-        nn.Conv2d, nn.BatchNorm2d, nn.SyncBatchNorm,
-        nn.SiLU, nn.ReLU, nn.LeakyReLU, nn.GELU,
-        nn.Upsample, nn.MaxPool2d, nn.AdaptiveAvgPool2d,
-        nn.Dropout, nn.Identity,
-    ]
-
-    # ---- Ultralytics YOLOv8 (somente se forem classes/funções) ----
-    # conv
-    for name in ["Conv", "DWConv", "RepConv", "Concat"]:
-        x = maybe_get(um.conv, name)
-        if x: allow.append(x)
-
-    # block
-    for name in ["C2f", "Bottleneck", "SPPF", "C3", "C3x", "BottleneckCSP", "DFL"]:
-        x = maybe_get(um.block, name)
-        if x: allow.append(x)
-
-    # head
-    for name in ["Detect", "Classify", "Segment", "Pose", "RTDETRDecoder"]:
-        x = maybe_get(um.head, name)
-        if x: allow.append(x)
-
-    # IMPORTANTE: não adicionar módulos inteiros aqui (ex.: um.rtm, um.transformer) — só classes/funções!
-
-    add_safe_globals(allow)
-
-
 # ---------------------------------------------------------
-# 2) Redis: aceita REDIS_URL OU HOST/PORT/USER/PASS (Upstash)
+# Redis: aceita REDIS_URL OU HOST/PORT/USER/PASS (Upstash)
 # ---------------------------------------------------------
 def connect_redis():
     url  = (os.getenv("REDIS_URL") or "").strip()
@@ -107,7 +50,7 @@ def connect_redis():
         raise
 
 # -----------------------------
-# 3) Configurações de execução
+# Configurações de execução
 # -----------------------------
 r = connect_redis()
 
@@ -121,7 +64,7 @@ IDLE_EXIT_MIN = int(os.getenv("IDLE_EXIT_MIN", "15"))
 IDLE_EXIT_SEC = IDLE_EXIT_MIN * 60
 
 # ------------------------------------------------
-# 4) Utilitários de I/O
+# Utilitários de I/O
 # ------------------------------------------------
 def download_to_temp(url: str) -> str:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".img") as tmp:
@@ -149,7 +92,7 @@ def read_image_from_job(job: dict):
     return None
 
 # ----------------------------------------
-# 5) Processamento do job
+# Processamento do job
 # ----------------------------------------
 def process_job(payload: str, processor: HudProcessor):
     job = json.loads(payload)
@@ -176,13 +119,11 @@ def process_job(payload: str, processor: HudProcessor):
         r.hset(f"job:{job_id}", mapping={"status": "failed", "error": str(e)})
 
 # ----------------------
-# 6) Loop principal
+# Loop principal
 # ----------------------
 def main():
-    # Habilita allowlist ANTES de carregar o YOLO
-    _allow_ultralytics_unpickling()
-
     log.info("HudProcessor: inicializando...")
+    # Com o monkey patch ativo, o YOLO carrega sem weights_only
     processor = HudProcessor(ckpt_path="weights/best.pt")
     log.info("[worker] device ativo: cpu/gpu conforme core")
 
@@ -202,4 +143,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
