@@ -52,39 +52,25 @@ def _allow_ultralytics_unpickling():
 # 1) Redis com keepalive + reconexão
 # =======================================
 def connect_redis():
-    import ssl
     url  = (os.getenv("REDIS_URL") or "").strip()
     host = os.getenv("REDIS_HOST")
-    port = int(os.getenv("REDIS_PORT", "6379"))
+    port = os.getenv("REDIS_PORT", "6379")
     user = os.getenv("REDIS_USER")
     pw   = os.getenv("REDIS_PASS")
 
-    # SSLContext que ignora verificação de certificado (Upstash com TLS)
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
+    # Se veio URL, padroniza para rediss:// (TLS) e usa somente from_url
+    if url:
+        if url.startswith("redis://"):
+            url = "rediss://" + url.split("://", 1)[1]
+        return redis.Redis.from_url(url, decode_responses=True)
 
-    opts = dict(
-        decode_responses=True,
-        socket_keepalive=True,
-        health_check_interval=15,
-        socket_timeout=10,
-        retry_on_timeout=True,
-        ssl=True,
-        ssl_context=ctx,   # <- em vez de ssl_cert_reqs
-    )
-
-    if url and (url.startswith("redis://") or url.startswith("rediss://")):
-        log.info(f"[worker] Redis via URL: {url.split('@')[-1]}")
-        return redis.Redis.from_url(url, **opts)
-
+    # Se veio em partes, monta um rediss:// e usa from_url
     if host and user and pw:
-        log.info(f"[worker] Redis via HOST: {host}")
-        return redis.Redis(
-            host=host, port=port, username=user, password=pw, **opts
-        )
+        built = f"rediss://{user}:{pw}@{host}:{port}"
+        return redis.Redis.from_url(built, decode_responses=True)
 
     raise RuntimeError("Credenciais Redis ausentes (REDIS_URL ou HOST/PORT/USER/PASS).")
+
 
     except Exception as e:
         log.error(f"[worker] Falha ao conectar Redis: {e}")
@@ -234,4 +220,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
