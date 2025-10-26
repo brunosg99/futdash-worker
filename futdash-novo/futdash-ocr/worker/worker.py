@@ -52,36 +52,39 @@ def _allow_ultralytics_unpickling():
 # 1) Redis com keepalive + reconexão
 # =======================================
 def connect_redis():
-    url = (os.getenv("REDIS_URL") or "").strip()
+    import ssl
+    url  = (os.getenv("REDIS_URL") or "").strip()
     host = os.getenv("REDIS_HOST")
     port = int(os.getenv("REDIS_PORT", "6379"))
     user = os.getenv("REDIS_USER")
     pw   = os.getenv("REDIS_PASS")
 
+    # SSLContext que ignora verificação de certificado (Upstash com TLS)
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
     opts = dict(
         decode_responses=True,
         socket_keepalive=True,
-        health_check_interval=15,  # envia PING automático
+        health_check_interval=15,
         socket_timeout=10,
         retry_on_timeout=True,
+        ssl=True,
+        ssl_context=ctx,   # <- em vez de ssl_cert_reqs
     )
 
-    try:
-        if url and (url.startswith("redis://") or url.startswith("rediss://")):
-            if url.startswith("rediss://"):
-                opts["ssl"] = True
-                opts["ssl_cert_reqs"] = ssl.CERT_NONE
-            log.info(f"[worker] Redis via URL: {url.split('@')[-1]}")
-            return redis.Redis.from_url(url, **opts)
+    if url and (url.startswith("redis://") or url.startswith("rediss://")):
+        log.info(f"[worker] Redis via URL: {url.split('@')[-1]}")
+        return redis.Redis.from_url(url, **opts)
 
-        if host and user and pw:
-            log.info(f"[worker] Redis via HOST: {host}")
-            return redis.Redis(
-                host=host, port=port, username=user, password=pw,
-                ssl=True, ssl_cert_reqs=ssl.CERT_NONE, **opts
-            )
+    if host and user and pw:
+        log.info(f"[worker] Redis via HOST: {host}")
+        return redis.Redis(
+            host=host, port=port, username=user, password=pw, **opts
+        )
 
-        raise RuntimeError("Credenciais Redis ausentes (REDIS_URL ou HOST/PORT/USER/PASS).")
+    raise RuntimeError("Credenciais Redis ausentes (REDIS_URL ou HOST/PORT/USER/PASS).")
 
     except Exception as e:
         log.error(f"[worker] Falha ao conectar Redis: {e}")
@@ -231,3 +234,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
