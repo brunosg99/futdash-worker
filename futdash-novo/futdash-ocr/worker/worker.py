@@ -1,61 +1,113 @@
 # worker/worker.py
-import os, json, time, ssl, logging, traceback, tempfile
+import os
+import json
+import time
+import ssl
+import logging
+import traceback
+import tempfile
+import random
 from pathlib import Path
 
-import cv2, numpy as np, redis, requests
-
-# >>> Monkey patch: força torch.load(weights_only=False) globalmente <<<
-import torch
-_ORIG_TORCH_LOAD = torch.load
-def _torch_load_no_weights_only(*args, **kwargs):
-    # Desativa o modo seguro por pesos. Útil quando o checkpoint é confiável (seu .pt).
-    kwargs["weights_only"] = False
-    return _ORIG_TORCH_LOAD(*args, **kwargs)
-torch.load = _torch_load_no_weights_only  # APLICA O PATCH ANTES DE IMPORTAR/CRIAR O MODELO
+import cv2
+import redis
+import requests
+from redis.exceptions import ConnectionError, TimeoutError, RedisError
 
 from core.core_logic import HudProcessor  # sua lógica principal
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s: %(message)s")
 log = logging.getLogger("worker")
 
-# ---------------------------------------------------------
-# Redis: aceita REDIS_URL OU HOST/PORT/USER/PASS (Upstash)
-# ---------------------------------------------------------
+# =========================
+# 0) Allowlist para YOLO/PT
+# =========================
+def _allow_ultralytics_unpickling():
+    """
+    Registra classes do Ultralytics/PyTorch necessárias para deserializar checkpoints
+    quando torch.load usa weights_only=True (comportamento padrão no PyTorch 2.6+).
+    """
+    import torch
+    import torch.nn as nn
+    import ultralytics
+    from ultralytics.nn import modules as um, tasks as ut
+
+    torch.serialization.add_safe_globals([
+        # núcleo YOLO
+        ut.DetectionModel,
+        # containers
+        nn.Sequential, nn.modules.container.Sequential, nn.ModuleList,
+        # blocos/camadas YOLOv8
+        um.conv.Conv,
+        um.conv.Concat,
+        um.block.C2f, um.block.Bottleneck, um.block.SPPF, um.block.DFL,
+        um.head.Detect,
+        # camadas PyTorch comuns
+        nn.Conv2d, nn.BatchNorm2d, nn.SiLU, nn.ReLU, nn.LeakyReLU,
+        nn.Upsample, nn.MaxPool2d, nn.AdaptiveAvgPool2d, nn.Dropout,
+    ])
+
+
+# =======================================
+# 1) Redis com keepalive + reconexão
+# =======================================
 def connect_redis():
-    url  = (os.getenv("REDIS_URL") or "").strip()
+    url = (os.getenv("REDIS_URL") or "").strip()
     host = os.getenv("REDIS_HOST")
     port = int(os.getenv("REDIS_PORT", "6379"))
     user = os.getenv("REDIS_USER")
     pw   = os.getenv("REDIS_PASS")
 
+    opts = dict(
+        decode_responses=True,
+        socket_keepalive=True,
+        health_check_interval=15,  # envia PING automático
+        socket_timeout=10,
+        retry_on_timeout=True,
+    )
+
     try:
         if url and (url.startswith("redis://") or url.startswith("rediss://")):
-            extra = {"decode_responses": True}
             if url.startswith("rediss://"):
-                extra["ssl_cert_reqs"] = ssl.CERT_NONE  # Upstash TLS
+                opts["ssl"] = True
+                opts["ssl_cert_reqs"] = ssl.CERT_NONE
             log.info(f"[worker] Redis via URL: {url.split('@')[-1]}")
-            return redis.Redis.from_url(url, **extra)
+            return redis.Redis.from_url(url, **opts)
 
         if host and user and pw:
             log.info(f"[worker] Redis via HOST: {host}")
             return redis.Redis(
                 host=host, port=port, username=user, password=pw,
-                ssl=True, ssl_cert_reqs=ssl.CERT_NONE, decode_responses=True
+                ssl=True, ssl_cert_reqs=ssl.CERT_NONE, **opts
             )
 
-        raise RuntimeError("Credenciais Redis ausentes (defina REDIS_URL OU HOST/PORT/USER/PASS).")
+        raise RuntimeError("Credenciais Redis ausentes (REDIS_URL ou HOST/PORT/USER/PASS).")
 
     except Exception as e:
         log.error(f"[worker] Falha ao conectar Redis: {e}")
         raise
 
-# -----------------------------
-# Configurações de execução
-# -----------------------------
+# conexão inicial
 r = connect_redis()
 
+def ensure_redis():
+    """Garante uma conexão viva; reconecta se necessário."""
+    global r
+    try:
+        r.ping()
+        return r
+    except Exception:
+        time.sleep(0.5 + random.random())
+        r = connect_redis()
+        return r
+
+
+# ============================
+# 2) Configurações e diretórios
+# ============================
 QUEUE_PLUS  = os.getenv("QUEUE_PLUS", "qv2:high")
 QUEUE_FREE  = os.getenv("QUEUE_FREE", "qv2:default")
+
 STORE_DIR   = Path(os.getenv("STORE_DIR", "/workspace/data"))
 RESULTS_DIR = STORE_DIR / "results"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -63,10 +115,12 @@ RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 IDLE_EXIT_MIN = int(os.getenv("IDLE_EXIT_MIN", "15"))
 IDLE_EXIT_SEC = IDLE_EXIT_MIN * 60
 
-# ------------------------------------------------
-# Utilitários de I/O
-# ------------------------------------------------
+
+# ==================================
+# 3) Utilitários de download/leitura
+# ==================================
 def download_to_temp(url: str) -> str:
+    """Baixa a imagem via HTTP e retorna caminho de arquivo temporário local."""
     with tempfile.NamedTemporaryFile(delete=False, suffix=".img") as tmp:
         resp = requests.get(url, timeout=60)
         resp.raise_for_status()
@@ -74,6 +128,10 @@ def download_to_temp(url: str) -> str:
         return tmp.name
 
 def read_image_from_job(job: dict):
+    """
+    Lê a imagem do job. Se houver 'download_url' (URL pública da API), baixa.
+    Senão tenta 'image_path' (caminho local no pod — normalmente não será válido).
+    """
     download_url = job.get("download_url")
     image_path   = job.get("image_path")
 
@@ -91,67 +149,85 @@ def read_image_from_job(job: dict):
 
     return None
 
-# ----------------------------------------
-# Processamento do job
-# ----------------------------------------
+
+# ===========================
+# 4) Processamento do Job
+# ===========================
 def process_job(payload: str, processor: HudProcessor):
     job = json.loads(payload)
     job_id = job.get("job_id")
 
     try:
         log.info(f"[worker] Processando job {job_id} ...")
-        r.hset(f"job:{job_id}", mapping={"status": "processing"})
+        rr = ensure_redis()
+        rr.hset(f"job:{job_id}", mapping={"status": "processing"})
 
         frame = read_image_from_job(job)
         if frame is None:
-            raise RuntimeError("Falha ao ler imagem (nem URL nem path local válidos).")
+            # mais contexto no erro ajuda a debugar 404/paths
+            raise RuntimeError(
+                f"Falha ao ler imagem (url={job.get('download_url')}, path={job.get('image_path')})"
+            )
 
         results = processor.process_frame(frame)
 
-        # Salva no disco (opcional, bom para auditoria/debug)
         out_path = RESULTS_DIR / f"{job_id}.json"
         out_path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        # >>> NOVO: grava o resultado também no Redis para o /jobs/{job_id}
-        r.hset(
-            f"job:{job_id}",
-            mapping={
-                "status": "done",
-                "result": json.dumps(results, ensure_ascii=False)  # string JSON
-            }
-        )
-
+        rr.hset(f"job:{job_id}", mapping={"status": "done"})
         log.info(f"[worker] ✅ Job {job_id} concluído.")
+
+    except requests.HTTPError as http_err:
+        # pega, por exemplo, 404 ao baixar a imagem
+        msg = f"HTTP {http_err.response.status_code} ao baixar {job.get('download_url')}"
+        log.error(f"[worker] Erro no job {job_id}: {msg}")
+        traceback.print_exc()
+        ensure_redis().hset(f"job:{job_id}", mapping={"status": "failed", "error": msg})
 
     except Exception as e:
         log.error(f"[worker] Erro no job {job_id}: {e}")
         traceback.print_exc()
-        r.hset(f"job:{job_id}", mapping={"status": "failed", "error": str(e)})
+        ensure_redis().hset(f"job:{job_id}", mapping={"status": "failed", "error": str(e)})
 
 
-# ----------------------
-# Loop principal
-# ----------------------
+# ===========================
+# 5) Loop principal
+# ===========================
 def main():
+    _allow_ultralytics_unpickling()
+
     log.info("HudProcessor: inicializando...")
-    # Com o monkey patch ativo, o YOLO carrega sem weights_only
     processor = HudProcessor(ckpt_path="weights/best.pt")
     log.info("[worker] device ativo: cpu/gpu conforme core")
 
     log.info(f"[worker] Iniciando... filas: {QUEUE_PLUS}, {QUEUE_FREE}")
     last_job_ts = time.time()
 
+    BRPOP_TIMEOUT = 10  # seg. (usa bloqueio em vez de polling agressivo)
+
     while True:
-        payload = r.lpop(QUEUE_PLUS) or r.lpop(QUEUE_FREE)
-        if payload:
-            last_job_ts = time.time()
-            process_job(payload, processor)
-        else:
-            time.sleep(1)
-            if time.time() - last_job_ts > IDLE_EXIT_SEC:
-                log.info(f"[worker] idle por {IDLE_EXIT_MIN} min. Encerrando.")
-                break
+        try:
+            rr = ensure_redis()
+
+            item = rr.brpop(QUEUE_PLUS, timeout=BRPOP_TIMEOUT)
+            if item is None:
+                item = rr.brpop(QUEUE_FREE, timeout=BRPOP_TIMEOUT)
+
+            if item:
+                _queue, payload = item
+                last_job_ts = time.time()
+                process_job(payload, processor)
+            # se item None, foi apenas timeout — segue para checar ociosidade
+
+        except (ConnectionError, TimeoutError, RedisError) as e:
+            log.warning(f"[worker] Redis caiu: {e}. Recolando...")
+            time.sleep(0.5)  # pequeno backoff e reconecta no próximo ciclo
+
+        # encerrar por ociosidade
+        if time.time() - last_job_ts > IDLE_EXIT_SEC:
+            log.info(f"[worker] idle por {IDLE_EXIT_MIN} min. Encerrando.")
+            break
+
 
 if __name__ == "__main__":
     main()
-
